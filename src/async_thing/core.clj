@@ -30,8 +30,11 @@
                           :result     (str "REPLY TO " (:request msg))})))
      :recv recv}))
 
+(defmacro maybe-swap-in! [])
+
 (let [sockets (atom {})
-      channels (atom {})]
+      channels (atom {})
+      chs (ref {})]
   (defn get-channel [location app-id]
 
     ;; Ensure there's a (promise of a) socket for this location
@@ -45,43 +48,40 @@
                          (future (deliver p (open-socket location)))
                          (assoc s location p)))))
 
-    (let [socket-promise (get @sockets location)]
+    (let [socket-promise (get @sockets location)
 
-      ;; Ensure there are channels for this app to this location
+          created-channel? (dosync
+                             (when-not (get-in @chs [location app-id])
+                               (alter chs assoc-in [location app-id] (chan))))
 
-      (swap! channels (fn [cs]
-                        (if (get-in cs [location app-id])
+          ch (get-in @chs [location app-id])]
 
-                          ;; We already have a channel
-                          cs
+      (when created-channel?
+        (future
+          (let [socket @socket-promise]
+            (println "Initialising channel for app" app-id "...")
+            (Thread/sleep 1000)
+            (println "Done")
 
-                          ;; We need to create a channel
-                          (let [to-socket (chan)]
-                            (future
-                              (let [socket @socket-promise]
-                                (println "Initialising channel for app" app-id "...")
-                                (Thread/sleep 1000)
-                                (println "Done")
+            ;; Send outgoing messages
+            (go-loop [n 1]
+              (if-let [msg (<! ch)]
+                (do ((:send socket) msg)
+                    (println "Delivered" n "messages")
+                    (recur (inc n)))
+                (println "Channel closed")))
 
-                                ;; Send outgoing messages
-                                (go-loop [n 1]
-                                  (if-let [msg (<! to-socket)]
-                                    (do ((:send socket) msg)
-                                        (println "Delivered" n "messages")
-                                        (recur (inc n)))
-                                    (println "Channel closed")))
+            ;; Receive incoming messages
+            (go-loop []
+              (when-let [reply (<! (:recv socket))]
+                (do (if-let [request-id (:request-id reply)]
+                      (let [reply-channel (get-reply-channel request-id)]
+                        (if (offer! reply-channel reply)
+                          (println "Received reply msg" (:result reply))))
+                      (println "Received non-reply message:" reply))
+                    (recur)))))))
 
-                                ;; Receive incoming messages
-                                (go-loop []
-                                  (when-let [reply (<! (:recv socket))]
-                                    (do (if-let [request-id (:request-id reply)]
-                                          (let [reply-channel (get-reply-channel request-id)]
-                                            (if (offer! reply-channel reply)
-                                              (println "Received reply msg" (:result reply))))
-                                          (println "Received non-reply message:" reply))
-                                        (recur))))))
-                            (assoc-in cs [location app-id] to-socket)))))
-      (get-in @channels [location app-id]))))
+      ch)))
 
 (let [next-request-id (atom 0)]
   (defn req-rep [location app-id msg]
